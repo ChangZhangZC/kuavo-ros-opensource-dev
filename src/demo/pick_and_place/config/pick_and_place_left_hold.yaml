@@ -55,4 +55,4 @@ right_arm_hold_joints: null
 # Fill with the validated six actuator position values.
 right_hand_hold_positions: null
 # Maximum permitted absolute initial right-arm joint deviation, radians.
-right_arm_start_tolerance: 0.2
+right_arm_start_tolerance: 0.05
