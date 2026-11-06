@@ -505,7 +505,7 @@ class Robot:
             joint_angles = self.compute_ik(poses_dict, q0=seed_q)
 
             if joint_angles is not None:
-                seed_q = list(joint_angles)
+                seed_q = list(joint_angles[0:7]) + list(current_q[7:14]) if arm == "left" else list(current_q[0:7]) + list(joint_angles[7:14])
                 # Publish joint trajectory directly
                 joint_msg = JointState()
                 joint_msg.header.stamp = rospy.Time.now()
@@ -541,7 +541,7 @@ class Robot:
         for _ in range(10): 
             joint_angles = self.compute_ik(final_poses_dict, q0=seed_q)
             if joint_angles is not None:
-                seed_q = list(joint_angles)
+                seed_q = list(joint_angles[0:7]) + list(current_q[7:14]) if arm == "left" else list(current_q[0:7]) + list(joint_angles[7:14])
                 joint_msg = JointState()
                 joint_msg.header.stamp = rospy.Time.now()
                 joint_msg.name = self.joint_names
@@ -595,7 +595,8 @@ class Robot:
                     max_left_error = max(max_left_error, err)
                 else:
                     max_right_error = max(max_right_error, err)
-            q = q_next
+            # Match the normal left-arm command path: the right arm stays fixed.
+            q = q_next[0:7] + list(start_q[7:14])
         rospy.loginfo(
             "IK-only %s: %d/%d solved, max_joint_step=%.4frad, "
             "max_left_FK_error=%.4fm, max_right_FK_error=%.4fm",
