@@ -170,6 +170,21 @@ class Robot:
         
         rospy.loginfo("Pick and place parameters loaded successfully")
     
+    def log_ik_failure(self, ik_cmd, reason):
+        """Log failed IK inputs without changing solver or control behavior."""
+        rospy.logerr("IK failure reason: %s", reason)
+        rospy.logerr("IK options: custom=%s, joint_angles_as_q0=%s, pos_tol=%.6g, "
+                     "ori_tol=%.6g, max_iterations=%d",
+                     ik_cmd.use_custom_ik_param, ik_cmd.joint_angles_as_q0,
+                     ik_cmd.ik_param.pos_constraint_tol,
+                     ik_cmd.ik_param.oritation_constraint_tol,
+                     ik_cmd.ik_param.major_iterations_limit)
+        for arm in ("left", "right"):
+            pose = getattr(ik_cmd.hand_poses, arm + "_pose")
+            rospy.logerr("IK request %s: xyz=%s, xyzw=%s, q0_rad=%s",
+                         arm, list(pose.pos_xyz), list(pose.quat_xyzw),
+                         list(pose.joint_angles))
+
     def compute_ik(self, poses_dict):
         """Compute IK for both arms based on the poses dictionary
         """
@@ -225,11 +240,14 @@ class Robot:
                 rospy.loginfo(f"IK solved successfully in {response.time_cost:.2f}ms")
                 return response.q_arm
             else:
-                rospy.logerr("IK service call failed")
+                self.log_ik_failure(
+                    ik_cmd, "solver returned success=False, time_cost=%.2fms" %
+                    response.time_cost
+                )
                 return None
-                
+
         except rospy.ServiceException as e:
-            rospy.logerr(f"IK service call failed: {e}")
+            self.log_ik_failure(ik_cmd, "ROS service exception: %s" % e)
             return None
 
     def cubic_spline_interpolate(self, start_transform, end_pose, num_points=200):
@@ -443,7 +461,18 @@ class Robot:
                 self.joint_pub.publish(joint_msg)
                 rospy.sleep(0.01)  # Small delay between waypoints
             else:
-                rospy.logerr(f"Failed to compute IK for waypoint {i}")
+                rospy.logerr(
+                    "Failed IK at waypoint %d/%d: target_%s_xyz=(%.4f, %.4f, %.4f), "
+                    "target_%s_xyzw=(%.4f, %.4f, %.4f, %.4f)",
+                    i, len(path_transforms) - 1, arm,
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z, arm,
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w
+                )
                 return False
         final_poses_dict = {
             "left": self.pose_to_transformstamped(target_pose) if arm == "left" else other_transform,
