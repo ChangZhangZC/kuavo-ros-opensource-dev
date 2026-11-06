@@ -58,6 +58,8 @@ class Task1Left:
         rospy.wait_for_message("/sensors_data_raw", sensorsData, timeout=5.0)
         rospy.sleep(0.2)
         self.initial_q = self.read_arm_q()
+        rospy.loginfo("Measured Eval1 start left joints (deg): %s",
+                      np.round(np.degrees(self.initial_q[:7]), 2).tolist())
         self.right_q = list(self.initial_q[7:14])
         self.base_xyz = np.asarray(self.state.robot_position(), dtype=float)
         base_xyzw = np.asarray(self.state.robot_orientation(), dtype=float)
@@ -181,14 +183,26 @@ class Task1Left:
         place = basket_xyz + np.array([0.0, 0.0, self.args.place_height])
         stages = [
             ("pregrasp", pregrasp), ("grasp", grasp), ("lift", lift),
+            ("return_ready", None),
             ("preplace", preplace), ("place", place), ("retract", preplace),
         ]
         targets = []
         seed = self.initial_q
         for label, point in stages:
-            rospy.loginfo("%s world xyz=%s", label, point.round(4))
-            seed = self.solve_key_pose(label, point, seed)
-            targets.append((label, seed))
+            if label == "return_ready":
+                # Eval1 brings the robot to q1_target2 before /simulator/init.
+                # Return only the left arm to its measured start joint pose.
+                # The right arm remains fixed and the gripper stays closed.
+                ready_q = list(self.initial_q)
+                delta = max(abs(a - b) for a, b in zip(ready_q[:7], seed[:7]))
+                rospy.loginfo("return_ready: max left joint delta=%.3frad", delta)
+                if delta > self.args.max_segment_delta:
+                    raise RuntimeError("return_ready: joint jump exceeds limit")
+                seed = ready_q
+            else:
+                rospy.loginfo("%s world xyz=%s", label, point.round(4))
+                seed = self.solve_key_pose(label, point, seed)
+            targets.append((label, list(seed)))
         rospy.loginfo("IK-only passed: %d key poses; right arm held at initial joints",
                       len(targets))
         return targets
