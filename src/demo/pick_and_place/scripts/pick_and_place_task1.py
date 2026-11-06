@@ -13,7 +13,7 @@ import tf2_ros
 import tf2_geometry_msgs  # Register PoseStamped TF2 conversions
 import geometry_msgs.msg
 from sensor_msgs.msg import JointState
-from kuavo_msgs.srv import changeArmCtrlMode, twoArmHandPoseCmdSrv
+from kuavo_msgs.srv import changeArmCtrlMode, twoArmHandPoseCmdSrv, fkSrv
 from kuavo_msgs.msg import sensorsData
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -91,6 +91,7 @@ class Robot:
         
         # IK service client
         self.ik_service_client = rospy.ServiceProxy('/ik/two_arm_hand_pose_cmd_srv', twoArmHandPoseCmdSrv)
+        self.fk_service_client = rospy.ServiceProxy('/ik/fk_srv', fkSrv)
 
         self.sensor_data_sub = rospy.Subscriber(
             '/sensors_data_raw', 
@@ -202,9 +203,53 @@ class Robot:
                          arm, list(pose.pos_xyz), list(pose.quat_xyzw),
                          list(pose.joint_angles))
 
-    def compute_ik(self, poses_dict):
-        """Compute IK for both arms based on the poses dictionary
-        """
+    def read_current_arm_q(self):
+        """Read a fresh 14D arm joint vector (radians), left then right."""
+        try:
+            msg = rospy.wait_for_message('/sensors_data_raw', sensorsData, timeout=3.0)
+        except (rospy.ROSException, rospy.ROSInterruptException) as exc:
+            rospy.logerr("Cannot read current arm joints: %s", exc)
+            return None
+        q = list(msg.joint_data.joint_q[12:26])
+        if len(q) != 14 or not all(math.isfinite(value) for value in q):
+            rospy.logerr("Invalid arm joint vector: expected 14 finite values, got %s", q)
+            return None
+        return q
+
+    def fk_arm_transforms(self, q):
+        """Return both IK-defined EEF transforms from Drake FK, in base_link."""
+        if q is None or len(q) != 14:
+            rospy.logerr("Drake FK requires 14 arm joint angles")
+            return None
+        try:
+            response = self.fk_service_client(list(q))
+        except rospy.ServiceException as exc:
+            rospy.logerr("Drake FK service failed: %s", exc)
+            return None
+        if not response.success:
+            rospy.logerr("Drake FK returned success=False")
+            return None
+        transforms = {}
+        for arm in ("left", "right"):
+            fk_pose = getattr(response.hand_poses, arm + "_pose")
+            if len(fk_pose.pos_xyz) != 3 or len(fk_pose.quat_xyzw) != 4:
+                rospy.logerr("Drake FK %s pose has invalid dimensions", arm)
+                return None
+            transform = TransformStamped()
+            transform.header.frame_id = self.base_frame
+            transform.header.stamp = rospy.Time.now()
+            transform.transform.translation.x = fk_pose.pos_xyz[0]
+            transform.transform.translation.y = fk_pose.pos_xyz[1]
+            transform.transform.translation.z = fk_pose.pos_xyz[2]
+            transform.transform.rotation.x = fk_pose.quat_xyzw[0]
+            transform.transform.rotation.y = fk_pose.quat_xyzw[1]
+            transform.transform.rotation.z = fk_pose.quat_xyzw[2]
+            transform.transform.rotation.w = fk_pose.quat_xyzw[3]
+            transforms[arm] = transform
+        return transforms
+
+    def compute_ik(self, poses_dict, q0=None, return_response=False, log_success=True):
+        """Compute two-arm IK, optionally using an explicit continuous 14D seed."""
         
         # Create IK command message
         ik_cmd = twoArmHandPoseCmd()
@@ -213,8 +258,9 @@ class Robot:
         ik_cmd.joint_angles_as_q0 = self.joint_angles_as_q0
         
         # Initialize joint angles (will be filled by IK solver)
-        ik_cmd.hand_poses.left_pose.joint_angles = self.current_arm_joint_state[0:7]
-        ik_cmd.hand_poses.right_pose.joint_angles = self.current_arm_joint_state[7:14]
+        seed = self.current_arm_joint_state if q0 is None else q0
+        ik_cmd.hand_poses.left_pose.joint_angles = list(seed[0:7])
+        ik_cmd.hand_poses.right_pose.joint_angles = list(seed[7:14])
         
         # Set elbow positions (not used in this implementation)
         ik_cmd.hand_poses.left_pose.elbow_pos_xyz = np.zeros(3)
@@ -254,8 +300,9 @@ class Robot:
             response = self.ik_service_client(ik_cmd)
             
             if response.success:
-                rospy.loginfo(f"IK solved successfully in {response.time_cost:.2f}ms")
-                return response.q_arm
+                if log_success:
+                    rospy.loginfo(f"IK solved successfully in {response.time_cost:.2f}ms")
+                return response if return_response else response.q_arm
             else:
                 self.log_ik_failure(
                     ik_cmd, "solver returned success=False, time_cost=%.2fms" %
@@ -426,22 +473,15 @@ class Robot:
         """Move robot to specified pose using IK service and direct joint control"""
         rospy.loginfo(f"Using {arm} arm for movement")
         
-        # Get current transform of the selected arm
-        current_transform = self.get_transform(self.base_frame, 
-                                              self.left_ee_frame if arm == "left" else self.right_ee_frame)
-        
-        if current_transform is None:
-            rospy.logerr(f"Failed to get current transform for {arm} arm")
+        # Use the same EEF reference for spline start, inactive arm and Drake IK.
+        current_q = self.read_current_arm_q()
+        fk_transforms = self.fk_arm_transforms(current_q)
+        if fk_transforms is None:
             return False
-        
-        # Get current transform of the other arm
         other_arm = "right" if arm == "left" else "left"
-        other_transform = self.get_transform(self.base_frame,
-                                            self.left_ee_frame if other_arm == "left" else self.right_ee_frame)
-        
-        if other_transform is None:
-            rospy.logerr(f"Failed to get current transform for {other_arm} arm")
-            return False
+        current_transform = fk_transforms[arm]
+        other_transform = fk_transforms[other_arm]
+        seed_q = current_q
         
         # Generate interpolation path
         path_transforms = self.cubic_spline_interpolate(current_transform, target_pose, self.path_points)
@@ -461,10 +501,11 @@ class Robot:
                 "right": transform if arm == "right" else other_transform,
             }
             
-            # Compute IK for this pose using service
-            joint_angles = self.compute_ik(poses_dict)
-            
+            # Reuse the preceding IK solution as the next waypoint seed.
+            joint_angles = self.compute_ik(poses_dict, q0=seed_q)
+
             if joint_angles is not None:
+                seed_q = list(joint_angles)
                 # Publish joint trajectory directly
                 joint_msg = JointState()
                 joint_msg.header.stamp = rospy.Time.now()
@@ -498,8 +539,9 @@ class Robot:
         
         rospy.loginfo("Sending final pose command multiple times to increase precision...")
         for _ in range(10): 
-            joint_angles = self.compute_ik(final_poses_dict)
+            joint_angles = self.compute_ik(final_poses_dict, q0=seed_q)
             if joint_angles is not None:
+                seed_q = list(joint_angles)
                 joint_msg = JointState()
                 joint_msg.header.stamp = rospy.Time.now()
                 joint_msg.name = self.joint_names
@@ -515,6 +557,76 @@ class Robot:
         rospy.loginfo("Movement completed")
         return True
     
+    def check_ik_path(self, stage, target_pose, start_q):
+        """Solve a virtual left-arm path; never publish arm or gripper commands."""
+        fk = self.fk_arm_transforms(start_q)
+        if fk is None:
+            return None
+        path = self.cubic_spline_interpolate(fk["left"], target_pose, self.path_points)
+        q = list(start_q)
+        max_joint_delta = 0.0
+        max_left_error = 0.0
+        max_right_error = 0.0
+        for i, transform in enumerate(path):
+            response = self.compute_ik(
+                {"left": transform, "right": fk["right"]},
+                q0=q, return_response=True, log_success=False
+            )
+            if response is None:
+                rospy.logerr("IK-only %s: failed at waypoint %d/%d",
+                             stage, i, len(path) - 1)
+                return None
+            q_next = list(response.q_arm)
+            if len(q_next) != 14 or not all(math.isfinite(value) for value in q_next):
+                rospy.logerr("IK-only %s: invalid IK joint vector at waypoint %d", stage, i)
+                return None
+            max_joint_delta = max(max_joint_delta, max(
+                abs(a - b) for a, b in zip(q_next, q)
+            ))
+            for arm, goal in (("left", transform), ("right", fk["right"])):
+                actual = getattr(response.hand_poses, arm + "_pose").pos_xyz
+                requested = goal.transform.translation
+                err = math.sqrt(
+                    (actual[0] - requested.x) ** 2 +
+                    (actual[1] - requested.y) ** 2 +
+                    (actual[2] - requested.z) ** 2
+                )
+                if arm == "left":
+                    max_left_error = max(max_left_error, err)
+                else:
+                    max_right_error = max(max_right_error, err)
+            q = q_next
+        rospy.loginfo(
+            "IK-only %s: %d/%d solved, max_joint_step=%.4frad, "
+            "max_left_FK_error=%.4fm, max_right_FK_error=%.4fm",
+            stage, len(path), len(path), max_joint_delta,
+            max_left_error, max_right_error
+        )
+        return q
+
+    def run_ik_only(self):
+        """Check pick/place IK from simulated poses without any robot actuation."""
+        rospy.loginfo("IK-only: no arm/gripper commands, mode switch, PID or home motion")
+        q = self.read_current_arm_q()
+        if q is None:
+            return False
+        object_pose = self.detect_object(None)
+        if object_pose is None:
+            return False
+        grasp_pose = self.create_pose(object_pose, "pick_grasp")
+        q = self.check_ik_path("pick", grasp_pose, q)
+        if q is None:
+            return False
+        place_pose = self.define_place_location(None)
+        if place_pose is None:
+            return False
+        place_target = self.create_pose(place_pose, "place_place")
+        q = self.check_ik_path("place", place_target, q)
+        if q is None:
+            return False
+        rospy.loginfo("IK-only: both virtual paths solved; no movement was commanded")
+        return True
+
     def sensor_data_callback(self, msg):
         self.current_arm_joint_state = msg.joint_data.joint_q[12:26]
 
@@ -1240,6 +1352,11 @@ def main():
         # Create robot instance
         robot = Robot()
         
+        # Dry-run exits before any arm-mode change, gripper command or PID motion.
+        if rospy.get_param('~ik_only', False):
+            robot.run_ik_only()
+            return
+
         # Load marker configuration
         config_file = rospy.get_param('~marker_config_file', 'config/markers.yaml')
         marker_config = robot.load_marker_config(config_file)
