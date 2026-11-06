@@ -158,7 +158,7 @@ class Robot:
         self.right_hand_hold_positions = list(right_hand_hold)
         if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in self.right_hand_hold_positions):
             raise ValueError("Right-hand hold positions must be finite numeric values")
-        self.right_arm_start_tolerance = float(rospy.get_param('/right_arm_start_tolerance', 0.2))
+        self.right_arm_start_tolerance = float(rospy.get_param('/right_arm_start_tolerance', 0.05))
 
         # Load joint transition path configuration
         self.transition_joint_states = {}
