@@ -82,6 +82,9 @@ class Robot:
         self.ik_solve_param.oritation_constraint_tol = 1e-3
         self.ik_solve_param.pos_constraint_tol = 1e-4
         self.ik_solve_param.pos_cost_weight = 10.0
+        self.ik_max_position_error_m = float(rospy.get_param('~ik_max_position_error_m', 0.02))
+        if not 0.0 < self.ik_max_position_error_m <= 0.2:
+            raise ValueError("IK maximum FK position error must be in (0, 0.2] m")
         self.joint_names = ['zarm_l7_joint_1', 'zarm_l7_joint_2', 'zarm_l7_joint_3', 'zarm_l7_joint_4', 'zarm_l7_joint_5', 'zarm_l7_joint_6', 'zarm_l7_joint_7', 'zarm_r7_joint_1', 'zarm_r7_joint_2', 'zarm_r7_joint_3', 'zarm_r7_joint_4', 'zarm_r7_joint_5', 'zarm_r7_joint_6', 'zarm_r7_joint_7']
         
         # Initialize publishers and subscribers
@@ -248,8 +251,9 @@ class Robot:
             transforms[arm] = transform
         return transforms
 
-    def compute_ik(self, poses_dict, q0=None, return_response=False, log_success=True):
-        """Compute two-arm IK, optionally using an explicit continuous 14D seed."""
+    def compute_ik(self, poses_dict, q0=None, return_response=False,
+                   log_success=True, validate_pose=True):
+        """Compute two-arm IK and reject solutions outside the FK error limit."""
         
         # Create IK command message
         ik_cmd = twoArmHandPoseCmd()
@@ -300,6 +304,26 @@ class Robot:
             response = self.ik_service_client(ik_cmd)
             
             if response.success:
+                if validate_pose:
+                    errors = {}
+                    for arm in ("left", "right"):
+                        expected = poses_dict[arm].transform.translation
+                        actual = list(getattr(response.hand_poses, arm + "_pose").pos_xyz)
+                        if len(actual) != 3 or not all(math.isfinite(v) for v in actual):
+                            rospy.logerr("IK %s returned invalid FK position: %s", arm, actual)
+                            return None
+                        errors[arm] = math.sqrt(
+                            (actual[0] - expected.x) ** 2 +
+                            (actual[1] - expected.y) ** 2 +
+                            (actual[2] - expected.z) ** 2
+                        )
+                    if max(errors.values()) > self.ik_max_position_error_m:
+                        rospy.logerr(
+                            "IK success rejected: FK position error left=%.4fm, "
+                            "right=%.4fm, limit=%.4fm",
+                            errors["left"], errors["right"], self.ik_max_position_error_m
+                        )
+                        return None
                 if log_success:
                     rospy.loginfo(f"IK solved successfully in {response.time_cost:.2f}ms")
                 return response if return_response else response.q_arm
@@ -567,10 +591,12 @@ class Robot:
         max_joint_delta = 0.0
         max_left_error = 0.0
         max_right_error = 0.0
+        first_invalid = None
+        invalid_count = 0
         for i, transform in enumerate(path):
             response = self.compute_ik(
                 {"left": transform, "right": fk["right"]},
-                q0=q, return_response=True, log_success=False
+                q0=q, return_response=True, log_success=False, validate_pose=False
             )
             if response is None:
                 rospy.logerr("IK-only %s: failed at waypoint %d/%d",
@@ -583,6 +609,7 @@ class Robot:
             max_joint_delta = max(max_joint_delta, max(
                 abs(a - b) for a, b in zip(q_next, q)
             ))
+            waypoint_errors = {}
             for arm, goal in (("left", transform), ("right", fk["right"])):
                 actual = getattr(response.hand_poses, arm + "_pose").pos_xyz
                 requested = goal.transform.translation
@@ -591,10 +618,15 @@ class Robot:
                     (actual[1] - requested.y) ** 2 +
                     (actual[2] - requested.z) ** 2
                 )
+                waypoint_errors[arm] = err
                 if arm == "left":
                     max_left_error = max(max_left_error, err)
                 else:
                     max_right_error = max(max_right_error, err)
+            if max(waypoint_errors.values()) > self.ik_max_position_error_m:
+                invalid_count += 1
+                if first_invalid is None:
+                    first_invalid = (i, waypoint_errors["left"], waypoint_errors["right"])
             # Match the normal left-arm command path: the right arm stays fixed.
             q = q_next[0:7] + list(start_q[7:14])
         rospy.loginfo(
@@ -603,11 +635,28 @@ class Robot:
             stage, len(path), len(path), max_joint_delta,
             max_left_error, max_right_error
         )
+        if first_invalid is not None:
+            index, left_error, right_error = first_invalid
+            rospy.logerr(
+                "IK-only %s INVALID: %d/%d waypoints exceed %.4fm FK tolerance; "
+                "first invalid waypoint=%d, left_error=%.4fm, right_error=%.4fm",
+                stage, invalid_count, len(path), self.ik_max_position_error_m,
+                index, left_error, right_error
+            )
+            return None
         return q
 
     def run_ik_only(self):
         """Check pick/place IK from simulated poses without any robot actuation."""
         rospy.loginfo("IK-only: no arm/gripper commands, mode switch, PID or home motion")
+        weight = float(rospy.get_param('~ik_only_pos_cost_weight',
+                                      self.ik_solve_param.pos_cost_weight))
+        if not math.isfinite(weight) or weight < 0.0:
+            rospy.logerr("Invalid IK-only pos_cost_weight: %s", weight)
+            return False
+        self.ik_solve_param.pos_cost_weight = weight
+        rospy.loginfo("IK-only parameters: pos_cost_weight=%.3f, FK error limit=%.4fm",
+                      weight, self.ik_max_position_error_m)
         q = self.read_current_arm_q()
         if q is None:
             return False
