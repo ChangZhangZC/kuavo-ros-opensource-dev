@@ -203,8 +203,8 @@ class Task1Left:
                 rospy.loginfo("%s world xyz=%s", label, point.round(4))
                 seed = self.solve_key_pose(label, point, seed)
             targets.append((label, list(seed)))
-        rospy.loginfo("IK-only passed: %d key poses; right arm held at initial joints",
-                      len(targets))
+        rospy.loginfo("IK-only plan passed: %d IK poses plus return_ready joint waypoint; right arm held",
+                      len(targets) - 1)
         return targets
 
     def init_controllers(self):
