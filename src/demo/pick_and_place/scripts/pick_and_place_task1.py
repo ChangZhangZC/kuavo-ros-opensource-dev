@@ -5,6 +5,7 @@ import rospy
 import yaml
 import json
 import os
+import sys
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from tf.transformations import quaternion_from_euler, euler_from_quaternion
 import math
@@ -19,6 +20,14 @@ from scipy.interpolate import CubicSpline
 import copy
 from kuavo_msgs.msg import twoArmHandPoseCmd, ikSolveParam, twoArmHandPose
 from geometry_msgs.msg import Transform, TransformStamped
+
+# Reuse the Task 1 MuJoCo gripper controller (same import path as eval1.py).
+_task1_sim_dir = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "data_challenge_simulator"
+))
+if _task1_sim_dir not in sys.path:
+    sys.path.insert(0, _task1_sim_dir)
+from utils.gripper_controller import GripperController
 
 import copy
 
@@ -77,8 +86,8 @@ class Robot:
         
         # Initialize publishers and subscribers
         self.joint_pub = rospy.Publisher('/kuavo_arm_traj', JointState, queue_size=1, tcp_nodelay=True)
-        # Task 1 MuJoCo scene uses Robotiq 2F85 grippers, not six-joint dexterous hands.
-        self.gripper_pub = rospy.Publisher('/gripper/command', JointState, queue_size=1, tcp_nodelay=True)
+        # Lazily start the native Task 1 controller when the first gripper command is needed.
+        self.gripper_controller = None
         
         # IK service client
         self.ik_service_client = rospy.ServiceProxy('/ik/two_arm_hand_pose_cmd_srv', twoArmHandPoseCmdSrv)
@@ -696,17 +705,29 @@ class Robot:
         return pose
 
     def _publish_task1_gripper(self, left_command):
-        """Command the left 2F85 claw while keeping the right command fixed."""
-        msg = JointState()
-        msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "gripper"
-        msg.name = ["left_gripper_joint", "right_gripper_joint"]
-        msg.position = [float(left_command), self.right_gripper_hold_cmd]
-        self.gripper_pub.publish(msg)
-        rospy.loginfo("Task 1 gripper command sent: left=%.1f, right=%.1f",
-                      msg.position[0], msg.position[1])
-        rospy.sleep(0.5)
-        return True
+        """Reuse Task 1 GripperController while holding the right gripper command."""
+        try:
+            if self.gripper_controller is None:
+                # Fail clearly if the selected MuJoCo scene has no 2F85 gripper interface.
+                rospy.wait_for_message('/gripper/state', JointState, timeout=2.0)
+                self.gripper_controller = GripperController()
+                self.gripper_controller.set_gripper_position(
+                    float(left_command), self.right_gripper_hold_cmd
+                )
+            else:
+                self.gripper_controller.control_left_gripper(float(left_command))
+
+            if self.gripper_controller.gripper_cmd_pub.get_num_connections() == 0:
+                rospy.sleep(0.1)
+            if self.gripper_controller.gripper_cmd_pub.get_num_connections() == 0:
+                rospy.logerr("Task 1 /gripper/command has no subscribers")
+                return False
+
+            rospy.sleep(0.5)
+            return True
+        except rospy.ROSException as exc:
+            rospy.logerr("Task 1 gripper interface unavailable: %s", exc)
+            return False
 
     def view_gripper(self):
         """Open the left 2F85 claw for the detection step."""
@@ -1133,7 +1154,8 @@ class Robot:
             # Task 1 simulation is expected to provide the initial arm pose.
             # Skip the original Home -> Transition prompt and motion.
             # Step 2: 检测物体
-            self.view_gripper()
+            if not self.view_gripper():
+                return False
             print("\n[Step 2] Detecting object")
             object_pose = self.detect_with_retry("object", marker_config)
             if object_pose is None:
@@ -1144,11 +1166,13 @@ class Robot:
             print("\n[Step 3] Picking object")
             if not self.get_user_input("Press ENTER to pick the object..."):
                 return False
-            self.open_gripper()
+            if not self.open_gripper():
+                return False
             if not self.pick_object(object_pose):
                 rospy.logerr("\033[31m抓取物体失败，请检查后重试\033[0m")
                 return False
-            self.close_gripper()
+            if not self.close_gripper():
+                return False
             rospy.sleep(1)
             # Step 4: 检测放置位置
             print("\n[Step 4] Detecting place location")
@@ -1165,7 +1189,8 @@ class Robot:
             if not self.place_object(place_pose):
                 rospy.logerr("\033[31m放置物体失败，请检查后重试\033[0m")
                 return False
-            self.open_gripper()
+            if not self.open_gripper():
+                return False
 
             # Step 6: 返回初始位置
             rospy.sleep(1)
@@ -1205,6 +1230,7 @@ class Robot:
 
 # Main function
 def main():
+    robot = None
     try:
         # Initialize ROS node
         rospy.init_node('pick_and_place_node')
@@ -1229,6 +1255,9 @@ def main():
         rospy.loginfo("Program interrupted by ROS shutdown")
     except Exception as e:
         rospy.logerr(f"An error occurred: {e}")
+    finally:
+        if robot is not None and robot.gripper_controller is not None:
+            robot.gripper_controller.stop()
 
 if __name__ == '__main__':
     main()
