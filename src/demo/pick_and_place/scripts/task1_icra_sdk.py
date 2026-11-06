@@ -179,7 +179,8 @@ class Task1Left:
         grasp = object_xyz + np.asarray(self.args.grasp_offset)
         pregrasp = grasp + np.array([0.0, 0.0, self.args.pregrasp_height])
         lift = grasp + np.array([0.0, 0.0, self.args.lift_height])
-        place_xy = basket_xyz + np.array([0.0, self.args.place_y_offset, 0.0])
+        place_xy = basket_xyz + np.array([self.args.place_x_offset,
+                                          self.args.place_y_offset, 0.0])
         preplace = place_xy + np.array([0.0, 0.0, self.args.preplace_height])
         place = place_xy + np.array([0.0, 0.0, self.args.place_height])
         stages = [
@@ -323,6 +324,8 @@ def main():
     parser.add_argument("--lift-height", type=float, default=0.18)
     parser.add_argument("--preplace-height", type=float, default=0.18)
     parser.add_argument("--place-height", type=float, default=0.10)
+    parser.add_argument("--place-x-offset", type=float, default=0.0,
+                        help="World-frame X shift of place/preplace targets, in meters")
     parser.add_argument("--place-y-offset", type=float, default=0.0,
                         help="World-frame Y shift of place/preplace targets, in meters")
     parser.add_argument("--max-fk-error", type=float, default=0.02)
@@ -337,7 +340,7 @@ def main():
     safety_values = (
         args.grasp_offset + (args.grasp_base_rpy or []) +
         [args.pregrasp_height, args.lift_height, args.preplace_height,
-         args.place_height, args.place_y_offset,
+         args.place_height, args.place_x_offset, args.place_y_offset,
          args.max_fk_error, args.max_orientation_error_deg,
          args.max_segment_delta, args.max_tracking_error,
          args.tracking_timeout, args.step_dt]
