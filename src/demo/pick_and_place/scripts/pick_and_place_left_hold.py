@@ -1,6 +1,6 @@
-# NOTE: Copied from pick_and_place.py; isolated left-arm task / fixed right-arm control.
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copied from pick_and_place.py; isolated left-arm task / fixed right-arm control.
 
 import rospy
 import yaml
