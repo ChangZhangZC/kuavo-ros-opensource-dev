@@ -717,10 +717,12 @@ class Robot:
             else:
                 self.gripper_controller.control_left_gripper(float(left_command))
 
-            if self.gripper_controller.gripper_cmd_pub.get_num_connections() == 0:
+            for _ in range(30):
+                if self.gripper_controller.gripper_cmd_pub.get_num_connections() > 0:
+                    break
                 rospy.sleep(0.1)
-            if self.gripper_controller.gripper_cmd_pub.get_num_connections() == 0:
-                rospy.logerr("Task 1 /gripper/command has no subscribers")
+            else:
+                rospy.logerr("Task 1 /gripper/command has no connected subscribers after 3s")
                 return False
 
             rospy.sleep(0.5)
