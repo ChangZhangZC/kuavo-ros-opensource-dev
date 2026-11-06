@@ -13,7 +13,7 @@ import tf2_geometry_msgs  # Register PoseStamped TF2 conversions
 import geometry_msgs.msg
 from sensor_msgs.msg import JointState
 from kuavo_msgs.srv import changeArmCtrlMode, twoArmHandPoseCmdSrv
-from kuavo_msgs.msg import robotHandPosition, sensorsData
+from kuavo_msgs.msg import sensorsData
 import numpy as np
 from scipy.interpolate import CubicSpline
 import copy
@@ -77,7 +77,8 @@ class Robot:
         
         # Initialize publishers and subscribers
         self.joint_pub = rospy.Publisher('/kuavo_arm_traj', JointState, queue_size=1, tcp_nodelay=True)
-        self.gripper_pub = rospy.Publisher('/control_robot_hand_position', robotHandPosition, queue_size=1, tcp_nodelay=True)
+        # Task 1 MuJoCo scene uses Robotiq 2F85 grippers, not six-joint dexterous hands.
+        self.gripper_pub = rospy.Publisher('/gripper/command', JointState, queue_size=1, tcp_nodelay=True)
         
         # IK service client
         self.ik_service_client = rospy.ServiceProxy('/ik/two_arm_hand_pose_cmd_srv', twoArmHandPoseCmdSrv)
@@ -149,10 +150,17 @@ class Robot:
         self.arc_height_factor = rospy.get_param('/path/arc_height_factor', 0.25)
         self.max_arc_height = rospy.get_param('/path/max_arc_height', 0.15)
         
-        # Gripper parameters
-        self.open_hand = rospy.get_param('/gripper/open_hand', [0, 0, 0, 0, 0, 0])
-        self.view_hand = [0, 100, 0, 0, 0, 0]
-        self.close_hand = rospy.get_param('/gripper/close_hand', [100, 100, 80, 75, 75, 75])
+        # Task 1 2F85 actuator commands: 0=open, 255=close.
+        self.gripper_open_cmd = float(rospy.get_param('~gripper_open_cmd', 0.0))
+        self.gripper_close_cmd = float(rospy.get_param('~gripper_close_cmd', 255.0))
+        # /gripper/command requires both grippers; hold the non-active side at a fixed command.
+        self.right_gripper_hold_cmd = float(rospy.get_param('~right_gripper_hold_cmd', 0.0))
+        if not all(0.0 <= value <= 255.0 for value in (
+                self.gripper_open_cmd, self.gripper_close_cmd, self.right_gripper_hold_cmd)):
+            raise ValueError("Task 1 gripper commands must be in [0, 255]")
+        rospy.loginfo("Task 1 2F85 grippers: open=%.1f, close=%.1f, right_hold=%.1f",
+                      self.gripper_open_cmd, self.gripper_close_cmd,
+                      self.right_gripper_hold_cmd)
         
         # Load joint transition path configuration
         self.transition_joint_states = {}
@@ -687,66 +695,43 @@ class Robot:
                           basket, pose.position.x, pose.position.y, pose.position.z)
         return pose
 
-    def view_gripper(self):
-        """view gripper"""
-        rospy.loginfo("Opening gripper to view...")
-        
-        # Create hand position message
-        hand_pose_msg = robotHandPosition()
-        if self.picking_arm == "left":
-            hand_pose_msg.left_hand_position = self.view_hand
-            hand_pose_msg.right_hand_position = self.open_hand
-        else:
-            hand_pose_msg.left_hand_position = self.open_hand
-            hand_pose_msg.right_hand_position = self.view_hand
+    def _publish_task1_gripper(self, left_command):
+        """Command the left 2F85 claw while keeping the right command fixed."""
+        msg = JointState()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "gripper"
+        msg.name = ["left_gripper_joint", "right_gripper_joint"]
+        msg.position = [float(left_command), self.right_gripper_hold_cmd]
+        self.gripper_pub.publish(msg)
+        rospy.loginfo("Task 1 gripper command sent: left=%.1f, right=%.1f",
+                      msg.position[0], msg.position[1])
+        rospy.sleep(0.5)
+        return True
 
-        
-        # Publish hand position
-        self.gripper_pub.publish(hand_pose_msg)
-        rospy.sleep(0.5)  # Wait for gripper to open
-        
-        self.is_gripper_open = True
-        rospy.loginfo("Gripper opened")
-        return True
-    
+    def view_gripper(self):
+        """Open the left 2F85 claw for the detection step."""
+        rospy.loginfo("Opening left 2F85 gripper for view...")
+        result = self._publish_task1_gripper(self.gripper_open_cmd)
+        if result:
+            self.is_gripper_open = True
+        return result
+
     def open_gripper(self):
-        """Open gripper"""
-        rospy.loginfo("Opening gripper...")
-        
-        # Create hand position message
-        hand_pose_msg = robotHandPosition()
-        hand_pose_msg.left_hand_position = self.open_hand
-        hand_pose_msg.right_hand_position = self.open_hand
-        
-        # Publish hand position
-        self.gripper_pub.publish(hand_pose_msg)
-        rospy.sleep(0.5)  # Wait for gripper to open
-        
-        self.is_gripper_open = True
-        rospy.loginfo("Gripper opened")
-        return True
-    
+        """Open only the selected Task 1 left gripper."""
+        rospy.loginfo("Opening left 2F85 gripper...")
+        result = self._publish_task1_gripper(self.gripper_open_cmd)
+        if result:
+            self.is_gripper_open = True
+        return result
+
     def close_gripper(self):
-        """Close gripper"""
-        rospy.loginfo("Closing gripper...")
-        
-        # Create hand position message
-        hand_pose_msg = robotHandPosition()
-        if self.picking_arm == "left":
-            hand_pose_msg.left_hand_position = self.close_hand
-            hand_pose_msg.right_hand_position = self.open_hand
-        else:
-            hand_pose_msg.left_hand_position = self.open_hand
-            hand_pose_msg.right_hand_position = self.close_hand
-        
-        # Publish hand position
-        self.gripper_pub.publish(hand_pose_msg)
-        rospy.sleep(0.5)  # Wait for gripper to close
-        
-        self.is_gripper_open = False
-        rospy.loginfo("Gripper closed")
-        return True
-    
+        """Close only the selected Task 1 left gripper."""
+        rospy.loginfo("Closing left 2F85 gripper...")
+        result = self._publish_task1_gripper(self.gripper_close_cmd)
+        if result:
+            self.is_gripper_open = False
+        return result
+
     def joint_cubic_spline_interpolate(self, trajectory, rate):
         """Improved joint space cubic spline interpolation (supports multi-segment trajectories)"""
         if len(trajectory) < 2:
