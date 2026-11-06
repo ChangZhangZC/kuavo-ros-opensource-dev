@@ -147,6 +147,8 @@ class Task1Left:
 
         # Match the real command: no IK-produced changes to the inactive arm.
         goal_q = list(result[:7]) + self.right_q
+        if any(abs(v) > math.pi for v in goal_q):
+            raise RuntimeError("%s: IK joint angle outside SDK [-pi, pi] range" % label)
         fk = self.robot.arm_fk(goal_q)
         if fk is None or fk[0] is None or fk[1] is None:
             raise RuntimeError("%s: SDK FK failed" % label)
@@ -192,6 +194,20 @@ class Task1Left:
         return targets
 
     def init_controllers(self):
+        # The environment/arm state must not have changed since IK-only planning.
+        live_q = self.read_arm_q()
+        max_drift = max(abs(a - b) for a, b in zip(live_q, self.initial_q))
+        live_base = np.asarray(self.state.robot_position(), dtype=float)
+        live_base_xyzw = np.asarray(self.state.robot_orientation(), dtype=float)
+        self.require_finite(live_base, 3, "live robot position")
+        self.require_finite(live_base_xyzw, 4, "live robot orientation")
+        base_move = float(np.linalg.norm(live_base - self.base_xyz))
+        base_turn = (self.base_rot.inv() * Rotation.from_quat(live_base_xyzw)).magnitude()
+        if max_drift > 0.08 or base_move > 0.02 or base_turn > 0.05:
+            raise RuntimeError(
+                "Robot moved since planning: arm=%.3frad, base=%.3fm, yaw/tilt=%.3frad; re-plan" %
+                (max_drift, base_move, base_turn)
+            )
         # Publish only in execute mode, after explicit user confirmation.
         if not self.robot.set_external_control_arm_mode():
             raise RuntimeError("Failed to switch to external arm control mode")
@@ -301,6 +317,17 @@ def main():
     parser.add_argument("--step-dt", type=float, default=0.02)
     args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
+    safety_values = (
+        args.grasp_offset + (args.grasp_base_rpy or []) +
+        [args.pregrasp_height, args.lift_height, args.preplace_height,
+         args.place_height, args.max_fk_error, args.max_orientation_error_deg,
+         args.max_segment_delta, args.max_tracking_error,
+         args.tracking_timeout, args.step_dt]
+    )
+    if not all(math.isfinite(x) for x in safety_values):
+        parser.error("Trajectory and IK parameters must be finite")
+    if not 0 < args.max_orientation_error_deg <= 90:
+        parser.error("Invalid orientation acceptance threshold")
     if (args.interpolation_points < 2 or args.step_dt <= 0.0 or
             args.pregrasp_height <= 0 or args.lift_height <= 0 or
             args.preplace_height <= args.place_height or args.place_height <= 0 or
