@@ -5,10 +5,11 @@ import rospy
 import yaml
 import json
 import os
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from tf.transformations import quaternion_from_euler, euler_from_quaternion
 import math
 import tf2_ros
+import tf2_geometry_msgs  # Register PoseStamped TF2 conversions
 import geometry_msgs.msg
 from sensor_msgs.msg import JointState
 from kuavo_msgs.srv import changeArmCtrlMode, twoArmHandPoseCmdSrv
@@ -22,6 +23,15 @@ from geometry_msgs.msg import Transform, TransformStamped
 import copy
 
 reverse_joint_states_index = [1, 2, 4, 5]
+
+# Task 1 candidates and spawn bounds (odom frame), from eval1.py.
+TOY_OBJECTS = ("dino", "dog", "elephant", "shark", "sheep")
+CAR_OBJECTS = ("fire", "roller", "school", "boat", "fire_engine")
+LEFT_SPAWN_X = (0.23, 0.43)
+LEFT_SPAWN_Y = (0.22, 0.45)
+SPAWN_Z_OFFSET = 0.005
+SPAWN_Z_TOLERANCE = 0.08
+
 
 class Robot:
     def __init__(self):
@@ -39,6 +49,9 @@ class Robot:
         self.control_hand_side = rospy.get_param('~control_hand_side', 1)  # Default to right hand
         # Add a variable to track which arm was used for picking
         self.picking_arm = "left" if self.control_hand_side == 0 else "right"
+        if self.picking_arm != "left":
+            raise ValueError("Task 1 target selection supports only control_hand_side=0 (left arm)")
+        self.selected_target = None
         # End effector frames
         self.left_ee_frame = "zarm_l7_end_effector"  # Updated to match the keyboard control script
         self.right_ee_frame = "zarm_r7_end_effector"  # Updated to match the keyboard control script
@@ -548,52 +561,103 @@ class Robot:
 
         return transform
         
-    def detect_object(self, marker_config):
-        """Detect object using ArUco marker"""
-        rospy.loginfo("Detecting target object using ArUco marker...")
-        
-        has_wrist = rospy.get_param('~has_wrist', True)
-        
-        # 首先使用head摄像头检测marker
-        marker_frame = marker_config['marker_object_frame']['frame_name']
-        base_frame = 'base_link'
-        
-        # Get transform from base to marker
-        transform = self.get_transform(base_frame, marker_frame)
-        
-        if transform is None:
-            rospy.logerr(f"Could not find the object marker with head camera: {marker_frame}")
+    def read_mujoco_pose(self, object_name, timeout=0.7):
+        """Read a simulator pose in its published coordinate frame."""
+        topic = f"/mujoco/{object_name}/pose"
+        try:
+            msg = rospy.wait_for_message(topic, PoseStamped, timeout=timeout)
+        except (rospy.ROSException, rospy.ROSInterruptException) as exc:
+            rospy.logwarn("Cannot read %s: %s", topic, exc)
             return None
-        
-        # Convert to Pose
-        object_pose = self.transform_to_pose(transform)
-        
-        rospy.loginfo(f"Object detected at position: x={object_pose.position.x}, y={object_pose.position.y}, z={object_pose.position.z}")
-        
-        return object_pose
+        if not msg.header.frame_id:
+            rospy.logwarn("%s has no frame_id", topic)
+            return None
+        xyz = (msg.pose.position.x, msg.pose.position.y, msg.pose.position.z)
+        if not all(math.isfinite(v) for v in xyz):
+            rospy.logwarn("%s contains invalid coordinates", topic)
+            return None
+        return msg
+
+    def pose_in_base_frame(self, pose_msg):
+        """Transform a PoseStamped from its declared frame to base_link."""
+        try:
+            result = self.tf_buffer.transform(
+                pose_msg, self.base_frame, timeout=rospy.Duration(1.0)
+            )
+            return result.pose
+        except tf2_ros.TransformException as exc:
+            rospy.logerr("Cannot transform %s to %s: %s",
+                         pose_msg.header.frame_id, self.base_frame, exc)
+            return None
+
+    def detect_active_objects(self):
+        """Find active Task 1 objects in the left spawn region in odom."""
+        basket_msg = self.read_mujoco_pose("basket1")
+        if basket_msg is None:
+            return []
+        if basket_msg.header.frame_id != "odom":
+            rospy.logerr("Expected basket1 in odom; got %s", basket_msg.header.frame_id)
+            return []
+        reference_z = basket_msg.pose.position.z + SPAWN_Z_OFFSET
+        active = []
+        for name in TOY_OBJECTS + CAR_OBJECTS:
+            msg = self.read_mujoco_pose(name)
+            if msg is None:
+                continue
+            if msg.header.frame_id != "odom":
+                rospy.logwarn("Ignoring %s: expected odom, got %s", name, msg.header.frame_id)
+                continue
+            p = msg.pose.position
+            if (LEFT_SPAWN_X[0] <= p.x <= LEFT_SPAWN_X[1]
+                    and LEFT_SPAWN_Y[0] <= p.y <= LEFT_SPAWN_Y[1]
+                    and abs(p.z - reference_z) <= SPAWN_Z_TOLERANCE):
+                active.append((name, msg))
+        return active
+
+    def select_pick_and_place_target(self):
+        """Lock this round's left-side object and its category-specific destination."""
+        active = self.detect_active_objects()
+        if len(active) != 1:
+            rospy.logerr("Expected exactly one left-side object, found %d: %s",
+                         len(active), [name for name, _ in active])
+            return None
+        name, object_msg = active[0]
+        category = "toy" if name in TOY_OBJECTS else "car"
+        # eval1.py: toy box is at negative odom Y; car box is at positive Y.
+        basket = "basket2" if category == "toy" else "basket1"
+        target = {"name": name, "category": category,
+                  "basket": basket, "object_msg": object_msg}
+        rospy.loginfo("Selected left-side target: %s (%s) -> %s", name, category, basket)
+        return target
+
+    def detect_object(self, marker_config):
+        """Select the left-side Task 1 object and return its base_link pose."""
+        target = self.select_pick_and_place_target()
+        if target is None:
+            return None
+        pose = self.pose_in_base_frame(target["object_msg"])
+        if pose is None:
+            return None
+        self.selected_target = target
+        rospy.loginfo("Selected %s grasp reference (base_link): (%.3f, %.3f, %.3f)",
+                      target["name"], pose.position.x, pose.position.y, pose.position.z)
+        return pose
 
     def define_place_location(self, marker_config):
-        """Define place location using ArUco marker"""
-        rospy.loginfo("Defining place location using ArUco marker...")
-        
-        # 首先使用head摄像头检测marker
-        marker_frame = marker_config['marker_place_frame']['frame_name']
-        base_frame = 'base_link'
-        
-        # Get transform from base to marker
-        transform = self.get_transform(base_frame, marker_frame)
-        
-        if transform is None:
-            rospy.logerr(f"Could not find the placement marker with head camera: {marker_frame}")
+        """Return the destination associated with the object selected before picking."""
+        if self.selected_target is None:
+            rospy.logerr("No object selected; cannot choose a destination")
             return None
-        
-        # Convert to Pose
-        place_pose = self.transform_to_pose(transform)
-        
-        rospy.loginfo(f"Place location detected at position: x={place_pose.position.x}, y={place_pose.position.y}, z={place_pose.position.z}")
-        
-        return place_pose
-    
+        basket = self.selected_target["basket"]
+        basket_msg = self.read_mujoco_pose(basket)
+        if basket_msg is None:
+            return None
+        pose = self.pose_in_base_frame(basket_msg)
+        if pose is not None:
+            rospy.loginfo("Selected %s destination reference (base_link): (%.3f, %.3f, %.3f)",
+                          basket, pose.position.x, pose.position.y, pose.position.z)
+        return pose
+
     def view_gripper(self):
         """view gripper"""
         rospy.loginfo("Opening gripper to view...")
@@ -1010,56 +1074,25 @@ class Robot:
             return False
 
     def detect_with_retry(self, detect_type="object", marker_config=None):
-        """
-        通用的检测重试函数
-        
-        Args:
-            detect_type: 检测类型，"object" 或 "place"
-            marker_config: marker配置信息
-        
-        Returns:
-            pose: 检测到的位姿，失败则返回None
-        """
-        has_wrist = rospy.get_param('~has_wrist', True)
-        wrist_frame = rospy.get_param(
-            f'~wrist_marker_{detect_type}_frame',
-            f"wrist_marker_{detect_type}_frame"
-        )
-        
+        """Keep the original manual Enter/retry interface with MuJoCo poses."""
         while True:
-            user_input = input(f"按回车键尝试检测{'物体' if detect_type == 'object' else '放置位置'}，按'q'退出检测: ")
-            if user_input.lower() == 'q':
+            user_input = input(
+                f"按回车键获取{'物体' if detect_type == 'object' else '放置位置'}的MuJoCo位姿，按'q'退出检测: "
+            )
+            if user_input.lower() == "q":
                 rospy.loginfo("用户选择退出检测")
                 return None
-            
-            # 首先尝试使用手腕相机检测
-            if has_wrist:
-                rospy.loginfo(f"尝试使用手腕相机检测{'物体' if detect_type == 'object' else '放置位置'}...")
-                wrist_transform = self.get_transform(self.base_frame, wrist_frame)
-                
-                if wrist_transform is not None:
-                    rospy.loginfo(f"手腕相机成功检测到{'物体' if detect_type == 'object' else '放置位置'}")
-                    pose = self.transform_to_pose(wrist_transform)
-                    break
-                else:
-                    rospy.logwarn("\033[31m手腕相机未检测到目标，尝试使用头部相机\033[0m")
-            
-            # 使用head相机检测
-            rospy.loginfo("使用头部相机检测...")
             if detect_type == "object":
                 pose = self.detect_object(marker_config)
-            else:
+            elif detect_type == "place":
                 pose = self.define_place_location(marker_config)
-            
-            if pose is not None:
-                rospy.loginfo("头部相机成功检测到目标")
-                break
             else:
-                rospy.logerr(f"\033[31m两个相机都未能检测到{'物体' if detect_type == 'object' else '放置位置'}，请调整后重试\033[0m")
-        
-        # 显示位置信息
-        self.display_pose_info(pose, detect_type)
-        return pose
+                rospy.logerr("Unknown detection type: %s", detect_type)
+                return None
+            if pose is not None:
+                self.display_pose_info(pose, detect_type)
+                return pose
+            rospy.logwarn("未获得有效目标位姿，按 Enter 重试（没有执行机械臂运动）")
 
     def display_pose_info(self, pose, detect_type):
         """显示位姿信息"""
@@ -1090,8 +1123,7 @@ class Robot:
             print("\n[Step 2] Detecting object")
             object_pose = self.detect_with_retry("object", marker_config)
             if object_pose is None:
-                #self.open_gripper()
-                self.transition_to_home()
+                # No target: do not send a return-to-home trajectory.
                 return False
             
             # Step 3: 抓取物体
@@ -1108,8 +1140,7 @@ class Robot:
             print("\n[Step 4] Detecting place location")
             place_pose = self.detect_with_retry("place", marker_config)
             if place_pose is None:
-                self.open_gripper()
-                self.transition_to_home()
+                # No destination: do not send a return-to-home trajectory.
                 return False
             
             # Step 5: 放置物体
