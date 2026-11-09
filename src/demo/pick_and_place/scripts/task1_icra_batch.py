@@ -354,11 +354,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output_dir = args.output_dir.expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if any(output_dir.iterdir()):
-        raise RuntimeError("Output directory must be empty (prevents overwriting episodes): %s" %
-                           output_dir)
+    output_root = args.output_dir.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+    output_dir = output_root / run_name
+    output_dir.mkdir(exist_ok=False)
     topics = tuple(dict.fromkeys((*DEFAULT_TOPICS, *args.topic)))
     write_json(output_dir / "run_config.json", {
         "started_at": utc_now(), "episodes": args.episodes,
