@@ -306,14 +306,99 @@ def append_summary(output_dir, context):
         writer.writerow({key: context.get(key, "") for key in SUMMARY_FIELDS})
 
 
+def read_batch_config(path):
+    """Read the optional YAML config; reject unknown fields and invalid types."""
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required for --config (pip install pyyaml)") from exc
+    with Path(path).expanduser().open("r", encoding="utf-8") as stream:
+        data = yaml.safe_load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("Batch YAML must be a mapping")
+    allowed = {
+        "batch": {
+            "episodes", "init_timeout", "episode_timeout", "service_timeout",
+            "shutdown_timeout", "settle_seconds", "record_start_delay",
+            "continue_on_failure",
+        },
+        "controller": {"script", "args"},
+        "success": {"mode", "command", "evaluator_timeout"},
+        "record": {"enabled", "format", "output_dir", "extra_topics"},
+    }
+    for section, values in data.items():
+        if section not in allowed:
+            raise ValueError("Unknown YAML section: %s" % section)
+        if not isinstance(values, dict):
+            raise ValueError("YAML section %s must be a mapping" % section)
+        unexpected = values.keys() - allowed[section]
+        if unexpected:
+            raise ValueError("Unknown YAML fields in %s: %s" %
+                             (section, sorted(unexpected)))
+    batch = data.get("batch", {})
+    controller = data.get("controller", {})
+    success = data.get("success", {})
+    record = data.get("record", {})
+    for key in ("episodes",):
+        if key in batch and type(batch[key]) is not int:
+            raise ValueError("batch.%s must be an integer" % key)
+    for section, keys in (
+        (batch, ("init_timeout", "episode_timeout", "service_timeout",
+                 "shutdown_timeout", "settle_seconds", "record_start_delay")),
+        (success, ("evaluator_timeout",)),
+    ):
+        for key in keys:
+            if key in section and type(section[key]) not in (int, float):
+                raise ValueError("YAML %s must be numeric" % key)
+    for section, key in ((batch, "continue_on_failure"), (record, "enabled")):
+        if key in section and type(section[key]) is not bool:
+            raise ValueError("YAML %s must be true or false" % key)
+    for section, key in (
+        (controller, "script"), (success, "mode"),
+        (record, "format"), (record, "output_dir"),
+    ):
+        if key in section and (not isinstance(section[key], str) or not section[key]):
+            raise ValueError("YAML %s must be a nonempty string" % key)
+    if "command" in success and success["command"] is not None and not isinstance(success["command"], str):
+        raise ValueError("success.command must be a string or null")
+    if "args" in controller and (
+        not isinstance(controller["args"], list)
+        or not all(isinstance(value, str) for value in controller["args"])
+    ):
+        raise ValueError("controller.args must be a list of strings")
+    if "extra_topics" in record and (
+        not isinstance(record["extra_topics"], list)
+        or not all(isinstance(value, str) and value.startswith("/")
+                   for value in record["extra_topics"])
+    ):
+        raise ValueError("record.extra_topics must be a list of absolute ROS topics")
+    if record.get("format", "rosbag") != "rosbag":
+        raise ValueError("Only record.format=rosbag is supported")
+    return data
+
+
 def parse_args():
+    raw_argv = rospy.myargv(argv=sys.argv)[1:]
+    default_config = Path(__file__).resolve().parent.parent / "config" / "task1_icra_batch.yaml"
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=Path, default=default_config,
+                               help="Batch YAML config (loaded by default)")
+    config_args, _ = config_parser.parse_known_args(raw_argv)
+    try:
+        cfg = read_batch_config(config_args.config)
+    except (OSError, ValueError, RuntimeError) as error:
+        config_parser.error("Cannot load YAML %s: %s" % (config_args.config, error))
+    batch = cfg.get("batch", {})
+    controller = cfg.get("controller", {})
+    success = cfg.get("success", {})
+    record = cfg.get("record", {})
     parser = argparse.ArgumentParser(
-        description="Multi-episode ROS1 controller runner; official deploy.py runs separately."
+        parents=[config_parser],
+        description="Multi-episode ROS1 controller runner; official deploy.py runs separately.",
     )
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--controller-command", default=None,
-                        help="One-episode process command (shell quoting supported, shell disabled). "
-                             "Default: task1_icra_sdk.py --execute")
+                        help="Override YAML controller with a full one-episode command")
     parser.add_argument("--success-mode",
                         choices=("exit_code", "task1_left_pose", "ros_success", "command"),
                         default="exit_code")
@@ -322,17 +407,38 @@ def parse_args():
                              "exits 0 for success, nonzero for failure.")
     parser.add_argument("--evaluator-timeout", type=float, default=10.0)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/task1_batch"))
-    parser.add_argument("--no-record", dest="record", action="store_false", default=True)
-    parser.add_argument("--topic", action="append", default=[],
-                        help="Extra ROS topic to record (repeatable). For LeRobot include cameras.")
+    recorder_flags = parser.add_mutually_exclusive_group()
+    recorder_flags.add_argument("--no-record", dest="record", action="store_false")
+    recorder_flags.add_argument("--record", dest="record", action="store_true")
+    parser.add_argument("--topic", action="append", default=None,
+                        help="Override YAML extra_topics (repeatable). Default state/object topics remain.")
     parser.add_argument("--init-timeout", type=float, default=120.0)
     parser.add_argument("--service-timeout", type=float, default=20.0)
     parser.add_argument("--episode-timeout", type=float, default=60.0)
     parser.add_argument("--shutdown-timeout", type=float, default=10.0)
     parser.add_argument("--record-start-delay", type=float, default=0.6)
     parser.add_argument("--settle-seconds", type=float, default=0.5)
-    parser.add_argument("--abort-on-failure", action="store_true")
-    args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
+    continuation_flags = parser.add_mutually_exclusive_group()
+    continuation_flags.add_argument("--abort-on-failure", dest="abort_on_failure",
+                                    action="store_true")
+    continuation_flags.add_argument("--continue-on-failure", dest="abort_on_failure",
+                                    action="store_false")
+    parser.set_defaults(
+        episodes=batch.get("episodes", 10),
+        init_timeout=batch.get("init_timeout", 120.0),
+        episode_timeout=batch.get("episode_timeout", 60.0),
+        service_timeout=batch.get("service_timeout", 20.0),
+        shutdown_timeout=batch.get("shutdown_timeout", 10.0),
+        settle_seconds=batch.get("settle_seconds", 0.5),
+        record_start_delay=batch.get("record_start_delay", 0.6),
+        abort_on_failure=not batch.get("continue_on_failure", True),
+        success_mode=success.get("mode", "exit_code"),
+        success_command=success.get("command"),
+        evaluator_timeout=success.get("evaluator_timeout", 10.0),
+        record=record.get("enabled", True),
+        output_dir=Path(record.get("output_dir", "outputs/task1_batch")),
+    )
+    args = parser.parse_args(raw_argv)
     if args.episodes < 1:
         parser.error("--episodes must be positive")
     if any(value <= 0 for value in (
@@ -342,13 +448,15 @@ def parse_args():
         parser.error("Invalid timeout/delay")
     if args.success_mode == "command" and not args.success_command:
         parser.error("--success-command is required when --success-mode=command")
-    if args.controller_command:
+    args.topic = record.get("extra_topics", []) if args.topic is None else args.topic
+    if args.controller_command is not None:
         args.controller = command_from_string(args.controller_command)
     else:
-        args.controller = [
-            sys.executable, str(Path(__file__).resolve().with_name("task1_icra_sdk.py")),
-            "--execute",
-        ]
+        script = controller.get("script")
+        if script is None:
+            script = str(Path(__file__).resolve().with_name("task1_icra_sdk.py"))
+        args.controller = [sys.executable, script, *controller.get("args", ["--execute"])]
+    args.config = config_args.config.expanduser().resolve()
     return args
 
 
@@ -362,7 +470,7 @@ def main():
     topics = tuple(dict.fromkeys((*DEFAULT_TOPICS, *args.topic)))
     write_json(output_dir / "run_config.json", {
         "started_at": utc_now(), "episodes": args.episodes,
-        "controller_command": args.controller,
+        "config": str(args.config), "controller_command": args.controller,
         "success_mode": args.success_mode, "record": args.record,
         "topics": topics if args.record else [],
         "note": "Scene seeds and MuJoCo lifecycle are owned by official deploy.py.",
