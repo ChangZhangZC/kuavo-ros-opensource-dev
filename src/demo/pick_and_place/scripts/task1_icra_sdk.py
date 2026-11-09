@@ -77,6 +77,8 @@ class Task1Left:
         else:
             grasp_base_rot = Rotation.from_euler("xyz", args.grasp_base_rpy, degrees=True)
         self.grasp_world_xyzw = (self.base_rot * grasp_base_rot).as_quat()
+        self.place_base_rot = Rotation.from_euler("xyz", args.place_base_rpy, degrees=True)
+        self.middle_q = [math.radians(value) for value in args.middle_left_deg] + self.right_q
         self.ik_params = KuavoIKParams(
             major_optimality_tol=1e-3, major_feasibility_tol=1e-3,
             minor_feasibility_tol=1e-3, major_iterations_limit=100,
@@ -130,14 +132,17 @@ class Task1Left:
                       object_xyz.round(4), basket_xyz.round(4))
         return name, category, object_xyz, basket_name, basket_xyz
 
-    def target_in_base(self, world_xyz):
+    def target_in_base(self, world_xyz, orientation_base=None):
         base_xyz = self.base_rot.inv().apply(np.asarray(world_xyz) - self.base_xyz)
-        base_quat = (self.base_rot.inv()
-                     * Rotation.from_quat(self.grasp_world_xyzw)).as_quat()
+        if orientation_base is None:
+            base_quat = (self.base_rot.inv()
+                         * Rotation.from_quat(self.grasp_world_xyzw)).as_quat()
+        else:
+            base_quat = orientation_base.as_quat()
         return KuavoPose(position=base_xyz.tolist(), orientation=base_quat.tolist())
 
-    def solve_key_pose(self, label, world_xyz, seed_q):
-        left_target = self.target_in_base(world_xyz)
+    def solve_key_pose(self, label, world_xyz, seed_q, orientation_base=None):
+        left_target = self.target_in_base(world_xyz, orientation_base)
         result = self.robot.arm_ik(
             left_target, self.right_pose,
             [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
@@ -175,38 +180,52 @@ class Task1Left:
             raise RuntimeError("%s: IK rejected (FK residual, orientation or joint jump)" % label)
         return goal_q
 
-    def plan(self, object_xyz, basket_xyz):
+    def plan(self, object_xyz, basket_xyz, category):
         grasp = object_xyz + np.asarray(self.args.grasp_offset)
         pregrasp = grasp + np.array([0.0, 0.0, self.args.pregrasp_height])
         lift = grasp + np.array([0.0, 0.0, self.args.lift_height])
-        place_xy = basket_xyz + np.array([self.args.place_x_offset,
-                                          self.args.place_y_offset, 0.0])
-        preplace = place_xy + np.array([0.0, 0.0, self.args.preplace_height])
-        place = place_xy + np.array([0.0, 0.0, self.args.place_height])
         stages = [
             ("pregrasp", pregrasp), ("grasp", grasp), ("lift", lift),
-            ("return_ready", None),
-            ("preplace", preplace), ("place", place), ("retract", preplace),
+            ("middle", None), ("place", None), ("retract", None),
         ]
         targets = []
         seed = self.initial_q
+        grasp_q = None
         for label, point in stages:
-            if label == "return_ready":
-                # Eval1 brings the robot to q1_target2 before /simulator/init.
-                # Return only the left arm to its measured start joint pose.
-                # The right arm remains fixed and the gripper stays closed.
-                ready_q = list(self.initial_q)
-                delta = max(abs(a - b) for a, b in zip(ready_q[:7], seed[:7]))
-                rospy.loginfo("return_ready: max left joint delta=%.3frad", delta)
+            if label in ("middle", "retract"):
+                # Demonstration middle joint waypoint; right arm remains held.
+                goal_q = list(self.middle_q)
+                delta = max(abs(a - b) for a, b in zip(goal_q[:7], seed[:7]))
+                rospy.loginfo("%s: max left joint delta=%.3frad", label, delta)
+                if any(abs(v) > math.pi for v in goal_q):
+                    raise RuntimeError("%s: middle joint angle outside [-pi, pi]" % label)
                 if delta > self.args.max_segment_delta:
-                    raise RuntimeError("return_ready: joint jump exceeds limit")
-                seed = ready_q
+                    raise RuntimeError("%s: joint jump exceeds limit" % label)
+                seed = goal_q
             else:
+                orientation_base = None
+                if label == "place":
+                    # FK trajectories: toy -> negative Y, car -> positive Y in base_link.
+                    ref_xy = (self.args.toy_place_base_xy if category == "toy"
+                              else self.args.car_place_base_xy)
+                    grasp_fk = self.robot.arm_fk(grasp_q)
+                    if grasp_fk is None or grasp_fk[0] is None:
+                        raise RuntimeError("Grasp FK failed when building place target")
+                    grasp_z_base = float(grasp_fk[0].position[2])
+                    place_base = np.array([ref_xy[0], ref_xy[1],
+                                           grasp_z_base + self.args.place_z_from_grasp])
+                    point = self.base_rot.apply(place_base) + self.base_xyz
+                    point[:2] += [self.args.place_x_offset, self.args.place_y_offset]
+                    orientation_base = self.place_base_rot
+                    rospy.loginfo("place: category=%s, reference base xyz=%s, basket odom xyz=%s",
+                                  category, place_base.round(4), basket_xyz.round(4))
                 rospy.loginfo("%s world xyz=%s", label, point.round(4))
-                seed = self.solve_key_pose(label, point, seed)
+                seed = self.solve_key_pose(label, point, seed, orientation_base)
+                if label == "grasp":
+                    grasp_q = list(seed)
             targets.append((label, list(seed)))
-        rospy.loginfo("IK-only plan passed: %d IK poses plus return_ready joint waypoint; right arm held",
-                      len(targets) - 1)
+        rospy.loginfo("IK-only plan passed: %d IK poses plus middle/retract joint waypoints; right arm held",
+                      len(targets) - 2)
         return targets
 
     def init_controllers(self):
@@ -322,12 +341,26 @@ def main():
                         help="Optional left TCP orientation in base_link, degrees")
     parser.add_argument("--pregrasp-height", type=float, default=0.12)
     parser.add_argument("--lift-height", type=float, default=0.18)
-    parser.add_argument("--preplace-height", type=float, default=0.18)
-    parser.add_argument("--place-height", type=float, default=0.10)
+    parser.add_argument("--middle-left-deg", nargs=7, type=float,
+                        default=[20.0, 20.0, -20.0, -120.0, -90.0, 0.0, 0.0],
+                        metavar=("J1", "J2", "J3", "J4", "J5", "J6", "J7"),
+                        help="Demonstration middle left-arm joint waypoint in degrees")
+    parser.add_argument("--toy-place-base-xy", nargs=2, type=float,
+                        default=[0.40862, -0.07725], metavar=("X", "Y"),
+                        help="Toy / Basket2 release EEF reference in SDK base frame, meters")
+    parser.add_argument("--car-place-base-xy", nargs=2, type=float,
+                        default=[0.40880, 0.08053], metavar=("X", "Y"),
+                        help="Car / Basket1 release EEF reference in SDK base frame, meters")
+    parser.add_argument("--place-z-from-grasp", type=float, default=0.2802,
+                        help="Release EEF base Z minus grasp EEF base Z, meters")
+    parser.add_argument("--place-base-rpy", nargs=3, type=float,
+                        default=[95.14, 11.14, -115.86],
+                        metavar=("ROLL", "PITCH", "YAW"),
+                        help="Release EEF orientation in SDK base frame, XYZ Euler degrees")
     parser.add_argument("--place-x-offset", type=float, default=0.0,
-                        help="World-frame X shift of place/preplace targets, in meters")
+                        help="World-frame X shift of place target, meters")
     parser.add_argument("--place-y-offset", type=float, default=0.0,
-                        help="World-frame Y shift of place/preplace targets, in meters")
+                        help="World-frame Y shift of place target, meters")
     parser.add_argument("--max-fk-error", type=float, default=0.02)
     parser.add_argument("--max-orientation-error-deg", type=float, default=15.0)
     parser.add_argument("--max-segment-delta", type=float, default=2.0)
@@ -339,11 +372,12 @@ def main():
 
     safety_values = (
         args.grasp_offset + (args.grasp_base_rpy or []) +
-        [args.pregrasp_height, args.lift_height, args.preplace_height,
-         args.place_height, args.place_x_offset, args.place_y_offset,
-         args.max_fk_error, args.max_orientation_error_deg,
-         args.max_segment_delta, args.max_tracking_error,
-         args.tracking_timeout, args.step_dt]
+        args.middle_left_deg + args.toy_place_base_xy + args.car_place_base_xy +
+        args.place_base_rpy +
+        [args.pregrasp_height, args.lift_height, args.place_z_from_grasp,
+         args.place_x_offset, args.place_y_offset, args.max_fk_error,
+         args.max_orientation_error_deg, args.max_segment_delta,
+         args.max_tracking_error, args.tracking_timeout, args.step_dt]
     )
     if not all(math.isfinite(x) for x in safety_values):
         parser.error("Trajectory and IK parameters must be finite")
@@ -351,7 +385,7 @@ def main():
         parser.error("Invalid orientation acceptance threshold")
     if (args.interpolation_points < 2 or args.step_dt <= 0.0 or
             args.pregrasp_height <= 0 or args.lift_height <= 0 or
-            args.preplace_height <= args.place_height or args.place_height <= 0 or
+            args.place_z_from_grasp <= 0 or
             args.max_fk_error <= 0 or args.max_tracking_error <= 0 or
             args.tracking_timeout <= 0 or args.max_segment_delta <= 0):
         parser.error("Invalid trajectory or safety parameter")
@@ -362,7 +396,7 @@ def main():
             raise RuntimeError("KuavoSDK WithIK initialization failed")
         task = Task1Left(args)
         name, category, obj, _, basket = task.select_left_object()
-        targets = task.plan(obj, basket)
+        targets = task.plan(obj, basket, category)
         if not args.execute:
             rospy.loginfo("DRY RUN ONLY: no arm/gripper control commands have been published")
             return 0
