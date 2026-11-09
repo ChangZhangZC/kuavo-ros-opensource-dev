@@ -292,10 +292,6 @@ class Task1Left:
                                (label, right_err))
 
     def execute(self, targets, name, category, basket_xyz):
-        print("Simulation motion requested. Type EXECUTE to enable arm and gripper commands:")
-        if input().strip() != "EXECUTE":
-            rospy.logwarn("No confirmation; aborting without motion")
-            return False
         self.init_controllers()
         self.start_gripper()
         previous = self.initial_q
@@ -333,9 +329,9 @@ class Task1Left:
 def main():
     parser = argparse.ArgumentParser(description="ICRA Eval1 left-arm SDK baseline")
     parser.add_argument("--execute", action="store_true",
-                        help="Enable MuJoCo motion after explicit console confirmation")
+                        help="Enable MuJoCo motion directly after successful IK-only planning")
     parser.add_argument("--grasp-offset", nargs=3, type=float,
-                        default=[0.0, 0.0, 0.05], metavar=("X", "Y", "Z"))
+                        default=[0.03, 0.0, 0.0], metavar=("X", "Y", "Z"))
     parser.add_argument("--grasp-base-rpy", nargs=3, type=float, default=None,
                         metavar=("ROLL", "PITCH", "YAW"),
                         help="Optional left TCP orientation in base_link, degrees")
