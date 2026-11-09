@@ -1,0 +1,27 @@
+# Batch collector configuration.
+# The official deploy.py owns MuJoCo lifecycle and scene random seeds.
+# Relative controller paths and output paths are evaluated from the working directory.
+batch:
+  episodes: 10
+  init_timeout: 60
+  episode_timeout: 60
+  service_timeout: 20
+  shutdown_timeout: 10
+  settle_seconds: 0.5
+  record_start_delay: 0.6
+  continue_on_failure: true
+
+controller:
+  script: "src/demo/pick_and_place/scripts/task1_icra_sdk.py"
+  args: ["--execute"]
+
+success:
+  mode: "exit_code"  # exit_code / task1_left_pose / ros_success / command
+  command: null       # Required for mode=command; exit 0 means success
+  evaluator_timeout: 10
+
+record:
+  enabled: true
+  format: "rosbag"    # v1 only supports rosbag; LeRobot conversion is separate
+  output_dir: "outputs/task1_batch"
+  extra_topics: []    # Additional real RGB topics; default robot/object topics are always recorded
